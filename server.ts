@@ -1,8 +1,10 @@
 import express from 'express';
 import path from 'path';
+import fs from 'fs';
+import dns from 'dns';
 import { createServer as createViteServer } from 'vite';
 import { db, Bot, User, Transaction, Withdraw, ClaimHistory, Notification, AdminLog } from './src/server/db.js';
-import { getApps, initializeApp } from 'firebase-admin/app';
+import { getApps, initializeApp, applicationDefault, cert } from 'firebase-admin/app';
 import { getFirestore, Firestore } from 'firebase-admin/firestore';
 
 const app = express();
@@ -10,6 +12,153 @@ const PORT = 3000;
 
 // Middleware
 app.use(express.json());
+
+// -------------------------------------------------------------
+// STARTUP VALIDATION & DIAGNOSTICS
+// -------------------------------------------------------------
+let isFirebaseInitialized = false;
+let isFirestoreConnected = false;
+
+const startupDiagnostics = async () => {
+  console.log('==================================================');
+  console.log('🚀 SYSTEM STARTUP DIAGNOSTICS');
+  console.log('==================================================');
+  
+  const requiredVars = ['APP_URL'];
+  const missingVars = requiredVars.filter(v => !process.env[v]);
+  
+  if (missingVars.length > 0) {
+    console.error(`❌ CRITICAL ERROR: Missing mandatory environment variables: ${missingVars.join(', ')}`);
+    console.error('Startup halted.');
+    process.exit(1);
+  }
+
+  const appUrl = process.env.APP_URL!;
+  console.log(`✅ APP_URL configured as: ${appUrl}`);
+
+  if (appUrl.trim() === '' || appUrl.includes(' ')) {
+    console.error(`❌ CRITICAL ERROR: APP_URL is empty or contains spaces: "${appUrl}"`);
+    process.exit(1);
+  }
+
+  if (appUrl.includes('localhost') || appUrl.includes('127.0.0.1') || appUrl.includes('firebaseapp.com') || appUrl.includes('web.app')) {
+    console.error(`❌ CRITICAL ERROR: APP_URL is invalid for Telegram webhooks: ${appUrl}`);
+    console.error('Do not use localhost or Firebase Hosting URLs. Please use the Render URL.');
+    process.exit(1);
+  }
+
+  let hostname = '';
+  try {
+    const parsedUrl = new URL(appUrl);
+    hostname = parsedUrl.hostname;
+    if (!hostname || !hostname.includes('.')) {
+      throw new Error('Invalid domain structure.');
+    }
+  } catch (err: any) {
+    console.error(`❌ CRITICAL ERROR: APP_URL format is invalid: ${appUrl}`);
+    process.exit(1);
+  }
+
+  try {
+    await new Promise((resolve, reject) => {
+      dns.lookup(hostname, (err, address) => {
+        if (err) reject(err);
+        else resolve(address);
+      });
+    });
+    console.log(`✅ APP_URL DNS resolution successful (${hostname}).`);
+  } catch (err: any) {
+    console.error(`❌ CRITICAL ERROR: DNS resolution failed for hostname "${hostname}": ${err.message}`);
+    process.exit(1);
+  }
+
+  const projectId = process.env.FIREBASE_PROJECT_ID || 'roy-share-official';
+  if (!process.env.FIREBASE_PROJECT_ID) {
+    console.warn(`⚠️ WARNING: FIREBASE_PROJECT_ID environment variable is missing. Defaulting to: ${projectId}.`);
+  } else if (projectId !== 'roy-share-official') {
+    console.warn(`⚠️ WARNING: FIREBASE_PROJECT_ID is ${projectId}, expected roy-share-official.`);
+  }
+
+  try {
+    if (!getApps().length) {
+      let credential;
+      let credentialSource = '';
+      let serviceAccountLoaded = false;
+      
+      const localServiceAccountPath = path.join(process.cwd(), '.firebase-service-account.json');
+      if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+        credentialSource = 'FIREBASE_SERVICE_ACCOUNT_JSON env var';
+        credential = cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON));
+        serviceAccountLoaded = true;
+      } else if (fs.existsSync(localServiceAccountPath)) {
+        credentialSource = 'Local .firebase-service-account.json file';
+        const serviceAccountRaw = fs.readFileSync(localServiceAccountPath, 'utf-8');
+        credential = cert(JSON.parse(serviceAccountRaw));
+        serviceAccountLoaded = true;
+      } else {
+        credentialSource = 'Application Default Credentials (ADC)';
+        credential = applicationDefault();
+      }
+
+      console.log(`\n--- Firebase Admin SDK Initialization ---`);
+      console.log(`projectId: ${projectId}`);
+      console.log(`credential source: ${credentialSource}`);
+      console.log(`service account loaded?: ${serviceAccountLoaded ? 'Yes' : 'No'}`);
+
+      initializeApp({
+        projectId: projectId,
+        credential: credential
+      });
+      isFirebaseInitialized = true;
+      console.log(`database initialized?: Yes`);
+    } else {
+      isFirebaseInitialized = true;
+      console.log(`✅ Firebase Admin already initialized.`);
+    }
+
+    const firestoreTest = getFirestore();
+    // Test connection
+    const testDoc = await firestoreTest.collection('startup_diagnostics').doc('test').set({ timestamp: new Date().toISOString() });
+    isFirestoreConnected = true;
+    console.log(`✅ Firestore connected successfully (Test Write ID: ${testDoc.writeTime.toDate().toISOString()})`);
+  } catch (err: any) {
+    console.error(`❌ CRITICAL ERROR: Firebase Admin SDK initialization or connection failed:`, err.message);
+    if (err.message.includes('credential')) {
+      console.error('Make sure GOOGLE_APPLICATION_CREDENTIALS is set to a valid Service Account JSON file path or configured correctly in Render.');
+    }
+  }
+
+  // Telegram webhook status diagnostic
+  console.log('\n--- Telegram Webhook Diagnostics ---');
+  const bots = db.getBots();
+  if (bots.length === 0) {
+    console.log('No bots configured in the database yet.');
+  } else {
+    for (const bot of bots) {
+      try {
+        const fetchRes = await fetch(`https://api.telegram.org/bot${bot.token}/getWebhookInfo`);
+        const data = await fetchRes.json();
+        if (data.ok) {
+          const currentUrl = data.result.url;
+          const expectedUrl = `${appUrl}/api/webhook/${bot.id}`;
+          if (!currentUrl) {
+            console.warn(`⚠️ Bot @${bot.username || bot.id} has NO webhook configured.`);
+          } else if (currentUrl !== expectedUrl) {
+            console.warn(`⚠️ Bot @${bot.username || bot.id} webhook MISMATCH: ${currentUrl} (expected ${expectedUrl})`);
+          } else {
+            console.log(`✅ Bot @${bot.username || bot.id} webhook is correctly configured: ${currentUrl}`);
+          }
+        } else {
+          console.error(`❌ Failed to get webhook info for Bot ${bot.id}: ${data.description}`);
+        }
+      } catch (err: any) {
+        console.error(`❌ Error connecting to Telegram API for Bot ${bot.id}: ${err.message}`);
+      }
+    }
+  }
+  
+  console.log('==================================================');
+};
 
 // In-memory OTP Store
 // key: botId_telegramId -> { otp: string, mobileNumber: string, attempts: number, expiresAt: number }
@@ -1151,6 +1300,16 @@ app.post('/api/bots/:botId/diagnostics', async (req, res) => {
   // 5. setWebhook
   const runSetWebhook = async () => {
     addLog('INFO', 'Running setWebhook test...');
+    addLog('INFO', `Webhook URL: ${expectedWebhookUrl}`);
+    
+    try {
+      const urlObj = new URL(expectedWebhookUrl);
+      addLog('INFO', `Host: ${urlObj.host}`);
+      addLog('INFO', `Path: ${urlObj.pathname}`);
+    } catch (e) {
+      addLog('ERROR', `Invalid URL format for expectedWebhookUrl.`);
+    }
+
     const start = Date.now();
     try {
       const fetchRes = await fetch(`https://api.telegram.org/bot${bot.token}/setWebhook`, {
@@ -1160,6 +1319,10 @@ app.post('/api/bots/:botId/diagnostics', async (req, res) => {
       });
       const latency = Date.now() - start;
       const data = await fetchRes.json();
+      
+      addLog('INFO', `HTTP Status: ${fetchRes.status}`);
+      addLog('INFO', `Telegram Response: ${JSON.stringify(data)}`);
+
       if (fetchRes.ok && data.ok) {
         addLog('SUCCESS', `setWebhook success. Webhook mapped to: ${expectedWebhookUrl}`);
         results.setWebhook = { status: 'SUCCESS', latency, response: data };
@@ -1619,6 +1782,9 @@ app.post('/api/bots/:botId/repair', async (req, res) => {
 // VITE AND STATIC ASSETS SERVING SETUP
 // -------------------------------------------------------------
 async function startServer() {
+  // Run startup diagnostics before listening
+  await startupDiagnostics();
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
