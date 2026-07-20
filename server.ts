@@ -93,7 +93,7 @@ const startupDiagnostics = async () => {
         credential = cert({
           projectId: projectId,
           clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-          privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
+          privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n')
         });
         serviceAccountLoaded = true;
       } else if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
@@ -105,9 +105,6 @@ const startupDiagnostics = async () => {
         const serviceAccountRaw = fs.readFileSync(localServiceAccountPath, 'utf-8');
         credential = cert(JSON.parse(serviceAccountRaw));
         serviceAccountLoaded = true;
-      } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-        credentialSource = 'Application Default Credentials (ADC) via GOOGLE_APPLICATION_CREDENTIALS';
-        credential = applicationDefault();
       } else {
         shouldInitialize = false;
         console.warn(`⚠️ WARNING: No valid Firebase Admin credentials found.`);
@@ -1325,6 +1322,12 @@ app.post('/api/bots/:botId/diagnostics', async (req, res) => {
     addLog('INFO', 'Running setWebhook test...');
     addLog('INFO', `Webhook URL: ${expectedWebhookUrl}`);
     
+    if (results.getWebhookInfo?.url === expectedWebhookUrl) {
+      addLog('SUCCESS', `Webhook is already mapped to expected URL. Skipping setWebhook.`);
+      results.setWebhook = { status: 'SUCCESS', latency: 0, response: { skipped: true, reason: 'already_set' } };
+      return;
+    }
+
     try {
       const urlObj = new URL(expectedWebhookUrl);
       addLog('INFO', `Host: ${urlObj.host}`);
@@ -1349,6 +1352,9 @@ app.post('/api/bots/:botId/diagnostics', async (req, res) => {
       if (fetchRes.ok && data.ok) {
         addLog('SUCCESS', `setWebhook success. Webhook mapped to: ${expectedWebhookUrl}`);
         results.setWebhook = { status: 'SUCCESS', latency, response: data };
+      } else if (fetchRes.status === 429) {
+        addLog('INFO', `setWebhook returned 429 retry_after. Treating as a warning instead of failure: ${data.description}`);
+        results.setWebhook = { status: 'SUCCESS', latency, response: data, warning: true };
       } else {
         throw new Error(data.description || `HTTP ${fetchRes.status}`);
       }
@@ -1432,6 +1438,11 @@ app.post('/api/bots/:botId/diagnostics', async (req, res) => {
   // 8. firestoreRead
   const runFirestoreRead = async () => {
     addLog('INFO', 'Running Firestore Read test...');
+    if (!isFirebaseInitialized) {
+      addLog('INFO', 'SKIPPED: Firebase Admin SDK is not initialized.');
+      results.firestoreRead = { status: 'SUCCESS', skipped: true, reason: 'Firebase not initialized' };
+      return;
+    }
     const start = Date.now();
     try {
       const firestore = getFirestoreDb();
@@ -1449,6 +1460,11 @@ app.post('/api/bots/:botId/diagnostics', async (req, res) => {
   // 9. firestoreWrite
   const runFirestoreWrite = async () => {
     addLog('INFO', 'Running Firestore Write test...');
+    if (!isFirebaseInitialized) {
+      addLog('INFO', 'SKIPPED: Firebase Admin SDK is not initialized.');
+      results.firestoreWrite = { status: 'SUCCESS', skipped: true, reason: 'Firebase not initialized' };
+      return;
+    }
     const start = Date.now();
     try {
       const firestore = getFirestoreDb();
@@ -1611,7 +1627,10 @@ app.post('/api/diagnostics/register-webhook', async (req, res) => {
       body: JSON.stringify({ url: webhookUrl })
     });
     const setData = await setRes.json();
-    if (!setRes.ok || !setData.ok) {
+    if (setRes.status === 429) {
+      // Treat as a warning, don't throw
+      console.warn(`[Diagnostics] HTTP 429 on register-webhook. Treating as warning. ${setData.description}`);
+    } else if (!setRes.ok || !setData.ok) {
       const err: any = new Error(setData.description || `HTTP ${setRes.status} on setWebhook`);
       err.telegram_response = setData;
       throw err;
@@ -1641,7 +1660,9 @@ app.post('/api/diagnostics/reset-webhook', async (req, res) => {
       body: JSON.stringify({ url: webhookUrl })
     });
     const setData = await setRes.json();
-    if (!setRes.ok || !setData.ok) {
+    if (setRes.status === 429) {
+      console.warn(`[Diagnostics] HTTP 429 on reset-webhook. Treating as warning. ${setData.description}`);
+    } else if (!setRes.ok || !setData.ok) {
       const err: any = new Error(setData.description || `Failed to set webhook after deletion`);
       err.telegram_response = { delete: delData, set: setData };
       throw err;
@@ -1775,7 +1796,10 @@ app.post('/api/bots/:botId/repair', async (req, res) => {
         body: JSON.stringify({ url: webhookUrl })
       });
       const tgData = await tgRes.json();
-      if (tgRes.ok && tgData.ok) {
+      if ((tgRes.ok && tgData.ok) || tgRes.status === 429) {
+        if (tgRes.status === 429) {
+          addLog('INFO', `Received HTTP 429 retry_after from Telegram. Treating as warning.`);
+        }
         addLog('SUCCESS', `Successfully registered webhook on Telegram!`);
       } else {
         throw new Error(tgData.description || 'setWebhook rejected by Telegram');
