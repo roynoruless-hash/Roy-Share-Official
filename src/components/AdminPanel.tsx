@@ -129,12 +129,20 @@ export default function AdminPanel({
   const runDiagnostics = async (botId: string, testName: string = 'all') => {
     if (!botId) return;
     setIsDiagRunning(true);
+    const ts = () => new Date().toISOString().split('T')[1].substring(0, 12);
     try {
       const res = await fetch(`/api/bots/${botId}/diagnostics`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ test: testName })
       });
+      
+      if (res.status === 404) {
+        setDiagLogs(prev => [...prev, `[${ts()}] [ERROR] Diagnostic endpoint is NOT IMPLEMENTED (HTTP 404).`]);
+        showToast('Diagnostic service is NOT IMPLEMENTED.', 'error');
+        return;
+      }
+
       const data = await res.json();
       if (data.success) {
         if (testName === 'all') {
@@ -147,11 +155,21 @@ export default function AdminPanel({
               ...prev,
               ...data.results
             };
-            const mandatorySuccess = 
-              nextResults.telegramApi?.status === 'SUCCESS' && 
-              nextResults.render?.status === 'SUCCESS';
-            nextResults.overallStatus = mandatorySuccess ? 'PASS' : 'FAIL';
-            setOverallPass(mandatorySuccess);
+            
+            // Check all 9 real tests to compute overallStatus
+            const allPassed = 
+              nextResults.getMe?.status === 'SUCCESS' &&
+              nextResults.getWebhookInfo?.status === 'SUCCESS' &&
+              nextResults.setWebhook?.status === 'SUCCESS' &&
+              nextResults.deleteWebhook?.status === 'SUCCESS' &&
+              nextResults.sendMessage?.status === 'SUCCESS' &&
+              nextResults.firestoreRead?.status === 'SUCCESS' &&
+              nextResults.firestoreWrite?.status === 'SUCCESS' &&
+              nextResults.envVars?.status === 'SUCCESS' &&
+              nextResults.renderHealth?.status === 'SUCCESS';
+
+            nextResults.overallStatus = allPassed ? 'PASS' : 'FAIL';
+            setOverallPass(allPassed);
             return nextResults;
           });
           setDiagLogs(prev => [...prev, ...data.logs]);
@@ -162,6 +180,7 @@ export default function AdminPanel({
       }
     } catch (err: any) {
       console.error(err);
+      setDiagLogs(prev => [...prev, `[${ts()}] [ERROR] Diagnostics failed: ${err.message}`]);
       showToast('Could not reach backend diagnostics service.', 'error');
     } finally {
       setIsDiagRunning(false);
@@ -171,23 +190,65 @@ export default function AdminPanel({
   const runAutoRepair = async (botId: string, actionName: string) => {
     if (!botId) return;
     setIsRepairing(actionName);
+    
+    let endpoint = '';
+    if (actionName === 'registerWebhook') endpoint = '/api/diagnostics/register-webhook';
+    else if (actionName === 'resetWebhook') endpoint = '/api/diagnostics/reset-webhook';
+    else if (actionName === 'reloadToken') endpoint = '/api/diagnostics/reload-token';
+    else if (actionName === 'refreshFirebase') endpoint = '/api/diagnostics/refresh-firestore';
+    else if (actionName === 'restartSession') endpoint = '/api/diagnostics/restart-session';
+    else if (actionName === 'clearCache') endpoint = '/api/diagnostics/clear-cache';
+    else {
+      showToast(`Unknown action "${actionName}"`, 'error');
+      setIsRepairing(null);
+      return;
+    }
+
+    const ts = () => new Date().toISOString().split('T')[1].substring(0, 12);
+    setDiagLogs(prev => [...prev, `[${ts()}] [INFO] Initiating automated repair via ${endpoint}...`]);
+
     try {
-      const res = await fetch(`/api/bots/${botId}/repair`, {
+      const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: actionName })
+        body: JSON.stringify({ botId })
       });
+      
+      if (res.status === 404) {
+        setDiagLogs(prev => [
+          ...prev, 
+          `[${ts()}] [ERROR] Endpoint ${endpoint} returned HTTP 404 (NOT IMPLEMENTED).`
+        ]);
+        showToast(`Endpoint ${actionName} is NOT IMPLEMENTED.`, 'error');
+        setIsRepairing(null);
+        return;
+      }
+
       const data = await res.json();
+      const execTime = data.execution_time ? ` (${data.execution_time}ms)` : '';
+
       if (data.success) {
-        setDiagLogs(prev => [...prev, ...data.logs]);
-        showToast(`Auto repair action: "${actionName}" succeeded!`, 'success');
+        setDiagLogs(prev => [
+          ...prev,
+          `[${ts()}] [SUCCESS] Repair action ${actionName} completed successfully${execTime}!`,
+          `[${ts()}] [INFO] Telegram payload: ${JSON.stringify(data.telegram_response)}`,
+          `[${ts()}] [INFO] Firebase payload: ${JSON.stringify(data.firebase_response)}`
+        ]);
+        showToast(`Auto repair "${actionName}" completed!`, 'success');
         await runDiagnostics(botId, 'all');
       } else {
-        if (data.logs) setDiagLogs(prev => [...prev, ...data.logs]);
+        setDiagLogs(prev => [
+          ...prev,
+          `[${ts()}] [ERROR] Repair action ${actionName} FAILED${execTime}: ${data.error || 'Unknown error'}`,
+          data.stack_trace ? `[${ts()}] [ERROR] Trace: ${data.stack_trace}` : '',
+          `[${ts()}] [INFO] Telegram payload: ${JSON.stringify(data.telegram_response)}`,
+          `[${ts()}] [INFO] Firebase payload: ${JSON.stringify(data.firebase_response)}`
+        ].filter(Boolean));
         showToast(data.error || 'Auto repair failed.', 'error');
       }
     } catch (err: any) {
       console.error(err);
+      setDiagLogs(prev => [...prev, `[${ts()}] [ERROR] Server contact failed for ${endpoint}: ${err.message}`]);
       showToast('Repair service unreachable.', 'error');
     } finally {
       setIsRepairing(null);
@@ -2273,68 +2334,47 @@ export default function AdminPanel({
                     </div>
 
                     {/* Report Card Grid */}
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                       {/* Left: Component Statuses */}
                       <div className="p-4 bg-slate-950/40 border border-slate-850 rounded-xl space-y-3 font-sans">
                         <h4 className="text-xs font-bold uppercase text-slate-400 tracking-wider">Infrastructure Checklist</h4>
                         <div className="space-y-2 text-[11px]">
-                          {/* 1. Bot Token & API */}
-                          <div className="flex justify-between items-center p-2 bg-slate-950/30 border border-slate-850 rounded">
-                            <span className="text-slate-300 font-medium">Telegram API Status (getMe)</span>
-                            <span className={`px-2 py-0.5 rounded font-mono font-bold text-[9px] ${
-                              diagResults?.telegramApi?.status === 'SUCCESS' ? 'bg-emerald-500/15 text-emerald-400' :
-                              diagResults?.telegramApi?.status === 'ERROR' ? 'bg-rose-500/15 text-rose-400' : 'bg-slate-800 text-slate-500'
-                            }`}>
-                              {diagResults?.telegramApi?.status || 'NOT SCANNED'}
-                            </span>
-                          </div>
+                          {/* Helper badge renderer */}
+                          {(() => {
+                            const renderStatusBadge = (testKey: string) => {
+                              const status = diagResults?.[testKey]?.status;
+                              if (!status) return <span className="px-2 py-0.5 rounded font-mono font-bold text-[9px] bg-slate-800 text-slate-500">NOT SCANNED</span>;
+                              if (status === 'SUCCESS' || status === 'PASS') {
+                                return <span className="px-2 py-0.5 rounded font-mono font-bold text-[9px] bg-emerald-500/15 text-emerald-400">SUCCESS</span>;
+                              }
+                              if (status === 'WARNING') {
+                                return <span className="px-2 py-0.5 rounded font-mono font-bold text-[9px] bg-amber-500/15 text-amber-400">WARNING</span>;
+                              }
+                              if (status === 'NOT IMPLEMENTED' || status === 'NOT_IMPLEMENTED') {
+                                return <span className="px-2 py-0.5 rounded font-mono font-bold text-[9px] bg-yellow-500/15 text-yellow-400">NOT IMPLEMENTED</span>;
+                              }
+                              return <span className="px-2 py-0.5 rounded font-mono font-bold text-[9px] bg-rose-500/15 text-rose-400">FAILED</span>;
+                            };
 
-                          {/* 2. Webhook Setup */}
-                          <div className="flex justify-between items-center p-2 bg-slate-950/30 border border-slate-850 rounded">
-                            <span className="text-slate-300 font-medium">Webhook Registration</span>
-                            <span className={`px-2 py-0.5 rounded font-mono font-bold text-[9px] ${
-                              diagResults?.webhook?.status === 'SUCCESS' ? 'bg-emerald-500/15 text-emerald-400' :
-                              diagResults?.webhook?.status === 'WARNING' ? 'bg-amber-500/15 text-amber-400' :
-                              diagResults?.webhook?.status === 'ERROR' ? 'bg-rose-500/15 text-rose-400' : 'bg-slate-800 text-slate-500'
-                            }`}>
-                              {diagResults?.webhook?.status || 'NOT SCANNED'}
-                            </span>
-                          </div>
+                            const checklistItems = [
+                              { key: 'getMe', label: '1. Telegram API (getMe)' },
+                              { key: 'getWebhookInfo', label: '2. Webhook Info Check' },
+                              { key: 'setWebhook', label: '3. Set Webhook API' },
+                              { key: 'deleteWebhook', label: '4. Delete Webhook API' },
+                              { key: 'sendMessage', label: '5. Send Message API' },
+                              { key: 'firestoreRead', label: '6. Firestore DB Read' },
+                              { key: 'firestoreWrite', label: '7. Firestore DB Write' },
+                              { key: 'envVars', label: '8. Environment Variables' },
+                              { key: 'renderHealth', label: '9. Render Engine Health' }
+                            ];
 
-                          {/* 3. Firebase/Firestore */}
-                          <div className="flex justify-between items-center p-2 bg-slate-950/30 border border-slate-850 rounded">
-                            <span className="text-slate-300 font-medium">Firebase Firestore DB Connection</span>
-                            <span className={`px-2 py-0.5 rounded font-mono font-bold text-[9px] ${
-                              diagResults?.firestore?.status === 'SUCCESS' ? 'bg-emerald-500/15 text-emerald-400' :
-                              diagResults?.firestore?.status === 'WARNING' ? 'bg-amber-500/15 text-amber-400' :
-                              diagResults?.firestore?.status === 'ERROR' ? 'bg-rose-500/15 text-rose-400' : 'bg-slate-800 text-slate-500'
-                            }`}>
-                              {diagResults?.firestore?.status || 'NOT SCANNED'}
-                            </span>
-                          </div>
-
-                          {/* 4. Render Health */}
-                          <div className="flex justify-between items-center p-2 bg-slate-950/30 border border-slate-850 rounded">
-                            <span className="text-slate-300 font-medium">Render Engine Health Check</span>
-                            <span className={`px-2 py-0.5 rounded font-mono font-bold text-[9px] ${
-                              diagResults?.render?.status === 'SUCCESS' ? 'bg-emerald-500/15 text-emerald-400' :
-                              diagResults?.render?.status === 'ERROR' ? 'bg-rose-500/15 text-rose-400' : 'bg-slate-800 text-slate-500'
-                            }`}>
-                              {diagResults?.render?.status || 'NOT SCANNED'}
-                            </span>
-                          </div>
-
-                          {/* 5. Environment Config */}
-                          <div className="flex justify-between items-center p-2 bg-slate-950/30 border border-slate-850 rounded">
-                            <span className="text-slate-300 font-medium">Environment Variables</span>
-                            <span className={`px-2 py-0.5 rounded font-mono font-bold text-[9px] ${
-                              diagResults?.env?.status === 'SUCCESS' ? 'bg-emerald-500/15 text-emerald-400' :
-                              diagResults?.env?.status === 'WARNING' ? 'bg-amber-500/15 text-amber-400' :
-                              diagResults?.env?.status === 'ERROR' ? 'bg-rose-500/15 text-rose-400' : 'bg-slate-800 text-slate-500'
-                            }`}>
-                              {diagResults?.env?.status || 'NOT SCANNED'}
-                            </span>
-                          </div>
+                            return checklistItems.map((item) => (
+                              <div key={item.key} className="flex justify-between items-center p-2 bg-slate-950/30 border border-slate-850 rounded">
+                                <span className="text-slate-300 font-medium">{item.label}</span>
+                                {renderStatusBadge(item.key)}
+                              </div>
+                            ));
+                          })()}
                         </div>
 
                         {/* Overall Bot Health Badge */}
@@ -2364,39 +2404,60 @@ export default function AdminPanel({
                             ⚡ Test getMe (Telegram Token)
                           </button>
                           <button
-                            onClick={() => runDiagnostics(activeBot.id, 'webhook')}
+                            onClick={() => runDiagnostics(activeBot.id, 'getWebhookInfo')}
                             disabled={isDiagRunning}
                             className="p-2 bg-slate-950 border border-slate-800 hover:border-indigo-500 text-slate-200 text-left rounded-lg text-[10px] transition font-semibold"
                           >
-                            ⚡ Test Webhook URL
+                            ⚡ Test getWebhookInfo Check
                           </button>
                           <button
-                            onClick={() => runDiagnostics(activeBot.id, 'firestore')}
+                            onClick={() => runDiagnostics(activeBot.id, 'setWebhook')}
                             disabled={isDiagRunning}
                             className="p-2 bg-slate-950 border border-slate-800 hover:border-indigo-500 text-slate-200 text-left rounded-lg text-[10px] transition font-semibold"
                           >
-                            ⚡ Test Firestore Connection
+                            ⚡ Test setWebhook Mapping
                           </button>
                           <button
-                            onClick={() => runDiagnostics(activeBot.id, 'env')}
+                            onClick={() => runDiagnostics(activeBot.id, 'deleteWebhook')}
                             disabled={isDiagRunning}
                             className="p-2 bg-slate-950 border border-slate-800 hover:border-indigo-500 text-slate-200 text-left rounded-lg text-[10px] transition font-semibold"
                           >
-                            ⚡ Test Environment & Port
+                            ⚡ Test deleteWebhook Repair
                           </button>
                           <button
-                            onClick={() => runDiagnostics(activeBot.id, 'render')}
+                            onClick={() => runDiagnostics(activeBot.id, 'sendMessage')}
                             disabled={isDiagRunning}
                             className="p-2 bg-slate-950 border border-slate-800 hover:border-indigo-500 text-slate-200 text-left rounded-lg text-[10px] transition font-semibold"
                           >
-                            ⚡ Test Render Health Path
+                            ✉️ Test sendMessage Dispatch
                           </button>
                           <button
-                            onClick={() => runDiagnostics(activeBot.id, 'message')}
+                            onClick={() => runDiagnostics(activeBot.id, 'firestoreRead')}
                             disabled={isDiagRunning}
                             className="p-2 bg-slate-950 border border-slate-800 hover:border-indigo-500 text-slate-200 text-left rounded-lg text-[10px] transition font-semibold"
                           >
-                            ✉️ Test Backend Message
+                            ⚡ Test Firestore Read Action
+                          </button>
+                          <button
+                            onClick={() => runDiagnostics(activeBot.id, 'firestoreWrite')}
+                            disabled={isDiagRunning}
+                            className="p-2 bg-slate-950 border border-slate-800 hover:border-indigo-500 text-slate-200 text-left rounded-lg text-[10px] transition font-semibold"
+                          >
+                            ⚡ Test Firestore Write Action
+                          </button>
+                          <button
+                            onClick={() => runDiagnostics(activeBot.id, 'envVars')}
+                            disabled={isDiagRunning}
+                            className="p-2 bg-slate-950 border border-slate-800 hover:border-indigo-500 text-slate-200 text-left rounded-lg text-[10px] transition font-semibold"
+                          >
+                            ⚡ Test Environment Config
+                          </button>
+                          <button
+                            onClick={() => runDiagnostics(activeBot.id, 'renderHealth')}
+                            disabled={isDiagRunning}
+                            className="p-2 bg-slate-950 border border-slate-800 hover:border-indigo-500 text-slate-200 text-left rounded-lg text-[10px] transition font-semibold col-span-2 text-center"
+                          >
+                            ⚡ Test Render Health Check (PORT 3000)
                           </button>
                         </div>
                       </div>
