@@ -84,9 +84,19 @@ const startupDiagnostics = async () => {
       let credential;
       let credentialSource = '';
       let serviceAccountLoaded = false;
+      let shouldInitialize = true;
       
       const localServiceAccountPath = path.join(process.cwd(), '.firebase-service-account.json');
-      if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+      
+      if (process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
+        credentialSource = 'FIREBASE_CLIENT_EMAIL & FIREBASE_PRIVATE_KEY env vars';
+        credential = cert({
+          projectId: projectId,
+          clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+          privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
+        });
+        serviceAccountLoaded = true;
+      } else if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
         credentialSource = 'FIREBASE_SERVICE_ACCOUNT_JSON env var';
         credential = cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON));
         serviceAccountLoaded = true;
@@ -95,32 +105,44 @@ const startupDiagnostics = async () => {
         const serviceAccountRaw = fs.readFileSync(localServiceAccountPath, 'utf-8');
         credential = cert(JSON.parse(serviceAccountRaw));
         serviceAccountLoaded = true;
-      } else {
-        credentialSource = 'Application Default Credentials (ADC)';
+      } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+        credentialSource = 'Application Default Credentials (ADC) via GOOGLE_APPLICATION_CREDENTIALS';
         credential = applicationDefault();
+      } else {
+        shouldInitialize = false;
+        console.warn(`⚠️ WARNING: No valid Firebase Admin credentials found.`);
+        console.warn(`Please configure FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, and FIREBASE_PRIVATE_KEY.`);
+        console.warn(`Firestore-dependent diagnostics will be disabled.`);
       }
 
       console.log(`\n--- Firebase Admin SDK Initialization ---`);
       console.log(`projectId: ${projectId}`);
-      console.log(`credential source: ${credentialSource}`);
-      console.log(`service account loaded?: ${serviceAccountLoaded ? 'Yes' : 'No'}`);
+      
+      if (shouldInitialize) {
+        console.log(`credential source: ${credentialSource}`);
+        console.log(`service account loaded?: ${serviceAccountLoaded ? 'Yes' : 'No'}`);
 
-      initializeApp({
-        projectId: projectId,
-        credential: credential
-      });
-      isFirebaseInitialized = true;
-      console.log(`database initialized?: Yes`);
+        initializeApp({
+          projectId: projectId,
+          credential: credential
+        });
+        isFirebaseInitialized = true;
+        console.log(`database initialized?: Yes`);
+      } else {
+        console.log(`database initialized?: No`);
+      }
     } else {
       isFirebaseInitialized = true;
       console.log(`✅ Firebase Admin already initialized.`);
     }
 
-    const firestoreTest = getFirestore();
-    // Test connection
-    const testDoc = await firestoreTest.collection('startup_diagnostics').doc('test').set({ timestamp: new Date().toISOString() });
-    isFirestoreConnected = true;
-    console.log(`✅ Firestore connected successfully (Test Write ID: ${testDoc.writeTime.toDate().toISOString()})`);
+    if (isFirebaseInitialized) {
+      const firestoreTest = getFirestore();
+      // Test connection
+      const testDoc = await firestoreTest.collection('startup_diagnostics').doc('test').set({ timestamp: new Date().toISOString() });
+      isFirestoreConnected = true;
+      console.log(`✅ Firestore connected successfully (Test Write ID: ${testDoc.writeTime.toDate().toISOString()})`);
+    }
   } catch (err: any) {
     console.error(`❌ CRITICAL ERROR: Firebase Admin SDK initialization or connection failed:`, err.message);
     if (err.message.includes('credential')) {
@@ -1079,11 +1101,12 @@ let firebaseInitError: any = null;
 function getFirestoreDb(): Firestore {
   if (firestoreDb) return firestoreDb;
   if (firebaseInitError) throw firebaseInitError;
+  
+  if (!isFirebaseInitialized) {
+    throw new Error('Firebase Admin SDK is not initialized. Check server credentials.');
+  }
 
   try {
-    if (!getApps().length) {
-      initializeApp();
-    }
     firestoreDb = getFirestore();
     return firestoreDb;
   } catch (err: any) {
