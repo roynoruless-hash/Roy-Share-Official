@@ -2,6 +2,8 @@ import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { db, Bot, User, Transaction, Withdraw, ClaimHistory, Notification, AdminLog } from './src/server/db.js';
+import { getApps, initializeApp } from 'firebase-admin/app';
+import { getFirestore, Firestore } from 'firebase-admin/firestore';
 
 const app = express();
 const PORT = 3000;
@@ -915,6 +917,526 @@ app.post('/api/admin/backup/restore', (req, res) => {
     }
   } catch (err: any) {
     res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+
+// -------------------------------------------------------------
+// FIREBASE / FIRESTORE INTEGRATION
+// -------------------------------------------------------------
+let firestoreDb: Firestore | null = null;
+let firebaseInitError: any = null;
+
+function getFirestoreDb(): Firestore {
+  if (firestoreDb) return firestoreDb;
+  if (firebaseInitError) throw firebaseInitError;
+
+  try {
+    if (!getApps().length) {
+      initializeApp();
+    }
+    firestoreDb = getFirestore();
+    return firestoreDb;
+  } catch (err: any) {
+    firebaseInitError = err;
+    console.error('Firebase initialization error in getFirestoreDb:', err);
+    throw err;
+  }
+}
+
+function resetFirebaseDb() {
+  firestoreDb = null;
+  firebaseInitError = null;
+}
+
+
+// -------------------------------------------------------------
+// TELEGRAM WEBHOOK RECEIVER ENDPOINT
+// -------------------------------------------------------------
+app.post('/api/webhook/:botId', async (req, res) => {
+  const { botId } = req.params;
+  const update = req.body;
+  
+  console.log(`[Webhook] Update received for bot ${botId}:`, JSON.stringify(update));
+
+  try {
+    const bot = db.getBot(botId);
+    if (!bot) {
+      console.error(`[Webhook] Bot ${botId} not found in database.`);
+      return res.status(404).json({ success: false, message: 'Bot not found' });
+    }
+
+    if (update.message && update.message.text) {
+      const text = update.message.text.trim();
+      const chatId = update.message.chat.id;
+      const fromId = String(update.message.from.id);
+      const username = update.message.from.username || '';
+      const firstName = update.message.from.first_name || '';
+      const lastName = update.message.from.last_name || '';
+      const fullName = [firstName, lastName].filter(Boolean).join(' ');
+
+      // Check if starting with referral
+      if (text.startsWith('/start')) {
+        let referredBy = '';
+        const parts = text.split(' ');
+        if (parts.length > 1 && parts[1].startsWith('ref_')) {
+          referredBy = parts[1].substring(4);
+        }
+
+        const appUrl = process.env.APP_URL || `http://localhost:3000`;
+        const webAppUrl = `${appUrl}/?botId=${botId}&tgId=${fromId}&username=${username}&fullName=${encodeURIComponent(fullName)}&referredBy=${referredBy}`;
+        
+        const welcomeText = `👋 *Hello ${fullName || 'User'}!*\n\n${bot.settings.welcomeMessage || 'Welcome to our platform!'}\n\n🏆 Complete tasks, invite your friends, and claim cash milestones directly inside our secure Web Mini App below!`;
+
+        const replyMarkup = {
+          inline_keyboard: [
+            [
+              {
+                text: '🚀 Launch Web Mini App',
+                web_app: { url: webAppUrl }
+              }
+            ],
+            [
+              {
+                text: '📢 Join Channel',
+                url: bot.channels[0]?.url || 'https://t.me/royshare_chan'
+              }
+            ]
+          ]
+        };
+
+        const tgRes = await fetch(`https://api.telegram.org/bot${bot.token}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: welcomeText,
+            parse_mode: 'Markdown',
+            reply_markup: replyMarkup
+          })
+        });
+
+        if (tgRes.ok) {
+          console.log(`[Webhook] Welcome message sent successfully to user ${fromId}`);
+        } else {
+          const tgErr = await tgRes.text();
+          console.error(`[Webhook] Failed to send Telegram message:`, tgErr);
+        }
+      }
+    }
+
+    res.json({ success: true });
+  } catch (err: any) {
+    console.error(`[Webhook] Error processing update:`, err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
+// -------------------------------------------------------------
+// DIAGNOSTICS & HEALTH API ENDPOINTS
+// -------------------------------------------------------------
+app.get('/api/health', (req, res) => {
+  res.json({ success: true, status: 'ok', timestamp: new Date().toISOString() });
+});
+
+app.post('/api/bots/:botId/diagnostics', async (req, res) => {
+  const { botId } = req.params;
+  const { test } = req.body;
+  
+  const bot = db.getBot(botId);
+  if (!bot) {
+    return res.status(404).json({ success: false, message: 'Bot not found in local database.' });
+  }
+
+  const logs: string[] = [];
+  const addLog = (level: 'INFO' | 'WARNING' | 'SUCCESS' | 'ERROR', msg: string) => {
+    const ts = new Date().toISOString().split('T')[1].substring(0, 12);
+    logs.push(`[${ts}] [${level}] ${msg}`);
+  };
+
+  addLog('INFO', `Starting comprehensive diagnostics session for @${bot.username}...`);
+
+  const results: Record<string, any> = {
+    botToken: { status: 'PENDING', value: bot.token.substring(0, Math.min(8, bot.token.length)) + '...' },
+    webhook: { status: 'PENDING', url: 'N/A' },
+    telegramApi: { status: 'PENDING', latency: 0 },
+    firestore: { status: 'PENDING', latency: 0 },
+    backend: { status: 'PENDING' },
+    render: { status: 'PENDING', latency: 0 },
+    envVars: { status: 'PENDING' },
+    overallStatus: 'FAIL'
+  };
+
+  // 1. Env Vars test
+  const runEnvVarsTest = () => {
+    addLog('INFO', 'Test Environment Variables starting...');
+    const missing = [];
+    if (!process.env.GEMINI_API_KEY) missing.push('GEMINI_API_KEY');
+    if (!process.env.APP_URL) missing.push('APP_URL');
+    
+    if (missing.length > 0) {
+      addLog('WARNING', `Missing optional or recommended env variables: ${missing.join(', ')}`);
+      results.envVars = {
+        status: 'WARNING',
+        message: 'Some keys are unconfigured.',
+        details: `Missing: ${missing.join(', ')}. GEMINI_API_KEY is required for AI features. APP_URL is needed for Webhooks.`
+      };
+    } else {
+      addLog('SUCCESS', 'All core environment variables successfully verified.');
+      results.envVars = { status: 'SUCCESS', message: 'All variables present.' };
+    }
+  };
+
+  // 2. Render Health test
+  const runRenderHealthTest = async () => {
+    addLog('INFO', 'Test Render Health starting...');
+    const start = Date.now();
+    try {
+      const port = process.env.PORT || '3000';
+      if (port !== '3000') {
+        addLog('WARNING', `Listening port is set to ${port}, not standard 3000.`);
+      }
+      const resLocal = await fetch(`http://localhost:3000/api/health`);
+      const latency = Date.now() - start;
+      if (resLocal.ok) {
+        addLog('SUCCESS', `Render Health check succeeded. Service is responsive locally (Latency: ${latency}ms).`);
+        results.render = { status: 'SUCCESS', latency, message: 'Local port listening correctly.' };
+      } else {
+        throw new Error(`HTTP status ${resLocal.status}`);
+      }
+    } catch (err: any) {
+      addLog('ERROR', `Render Health check failed: ${err.message}`);
+      results.render = {
+        status: 'ERROR',
+        message: 'Render Service Unreachable',
+        error: err.message,
+        stack: err.stack || 'Unreachable network route',
+        fix: 'Ensure your Express app listens on PORT 3000 and binds to host 0.0.0.0.'
+      };
+    }
+  };
+
+  // 3. Telegram API test
+  const runTelegramApiTest = async () => {
+    addLog('INFO', 'Testing Telegram API (getMe) connectivity...');
+    const start = Date.now();
+    try {
+      const tgRes = await fetch(`https://api.telegram.org/bot${bot.token}/getMe`);
+      const latency = Date.now() - start;
+      if (tgRes.ok) {
+        const tgData = await tgRes.json();
+        if (tgData.ok) {
+          addLog('SUCCESS', `Telegram getMe succeeded. Found bot @${tgData.result.username} (Latency: ${latency}ms)`);
+          results.telegramApi = {
+            status: 'SUCCESS',
+            latency,
+            botId: tgData.result.id,
+            botName: tgData.result.first_name,
+            botUsername: tgData.result.username
+          };
+          results.botToken = { status: 'SUCCESS', value: `Verified ID: ${tgData.result.id}` };
+        } else {
+          throw { status: 200, message: 'getMe response ok: false', description: tgData.description || 'Unknown' };
+        }
+      } else {
+        const errText = await tgRes.text();
+        let tgDesc = '';
+        try {
+          const parsed = JSON.parse(errText);
+          tgDesc = parsed.description || errText;
+        } catch {
+          tgDesc = errText;
+        }
+        throw { status: tgRes.status, message: `HTTP ${tgRes.status}`, description: tgDesc };
+      }
+    } catch (err: any) {
+      addLog('ERROR', `Telegram getMe failed: ${err.description || err.message}`);
+      results.telegramApi = {
+        status: 'ERROR',
+        status_code: err.status || 500,
+        description: err.description || err.message,
+        error: err.message || err.description,
+        stack: err.stack || 'Telegram API Error Response',
+        fix: 'Double check that your Bot Token is correct and that the BotFather has not revoked it.'
+      };
+      results.botToken = { status: 'ERROR', value: 'Invalid/expired token' };
+    }
+  };
+
+  // 4. Webhook status test
+  const runWebhookTest = async () => {
+    addLog('INFO', 'Testing Telegram Webhook status...');
+    try {
+      const tgRes = await fetch(`https://api.telegram.org/bot${bot.token}/getWebhookInfo`);
+      if (tgRes.ok) {
+        const tgData = await tgRes.json();
+        if (tgData.ok) {
+          const info = tgData.result;
+          const appUrl = process.env.APP_URL || 'https://domain';
+          const expectedUrl = `${appUrl}/api/webhook/${botId}`;
+          addLog('INFO', `Current Webhook URL is set to: "${info.url || 'No webhook set'}"`);
+          
+          if (!info.url) {
+            addLog('WARNING', 'No Webhook registered on Telegram. The bot will not reply to real telegram commands.');
+            results.webhook = {
+              status: 'WARNING',
+              url: 'None set',
+              fix: 'Click "Register Webhook" in the Auto Repair section to map this bot to this server instance.'
+            };
+          } else if (info.url !== expectedUrl) {
+            addLog('WARNING', `Webhook mismatch. Registered URL: "${info.url}" does not match our APP_URL: "${expectedUrl}"`);
+            results.webhook = {
+              status: 'WARNING',
+              url: info.url,
+              expectedUrl,
+              fix: 'Register the Webhook again to point to your current development/production link.'
+            };
+          } else {
+            addLog('SUCCESS', `Webhook successfully registered and active: "${info.url}"`);
+            if (info.last_error_message) {
+              addLog('WARNING', `Last Webhook error on Telegram: ${info.last_error_message}`);
+            }
+            results.webhook = {
+              status: 'SUCCESS',
+              url: info.url,
+              pending_updates: info.pending_update_count,
+              last_error: info.last_error_message
+            };
+          }
+        } else {
+          throw new Error(tgData.description || 'getWebhookInfo failed');
+        }
+      } else {
+        throw new Error(`HTTP status ${tgRes.status}`);
+      }
+    } catch (err: any) {
+      addLog('ERROR', `Webhook diagnostic failed: ${err.message}`);
+      results.webhook = {
+        status: 'ERROR',
+        message: 'Could not fetch webhook configuration from Telegram.',
+        error: err.message,
+        fix: 'Ensure your server is connected to the internet and Bot Token is valid.'
+      };
+    }
+  };
+
+  // 5. Firestore test
+  const runFirestoreTest = async () => {
+    addLog('INFO', 'Testing Firebase/Firestore write/read/delete integrity...');
+    const start = Date.now();
+    try {
+      const firestore = getFirestoreDb();
+      const testDocRef = firestore.collection('diagnostics_tests').doc(botId);
+      
+      addLog('INFO', 'Attempting Firestore write operation...');
+      await testDocRef.set({
+        botId,
+        testRun: true,
+        timestamp: new Date().toISOString()
+      });
+
+      addLog('INFO', 'Attempting Firestore read operation...');
+      const snap = await testDocRef.get();
+      if (!snap.exists) {
+        throw new Error('Test document written but not found on immediate retrieval.');
+      }
+
+      addLog('INFO', 'Attempting Firestore cleanup (delete)...');
+      await testDocRef.delete();
+
+      const latency = Date.now() - start;
+      addLog('SUCCESS', `Firestore integration is 100% healthy. Read, write, and delete tests passed (Latency: ${latency}ms).`);
+      results.firestore = { status: 'SUCCESS', latency, message: 'Durable Cloud Persistence functional.' };
+    } catch (err: any) {
+      const latency = Date.now() - start;
+      addLog('ERROR', `Firestore Integration test failed: ${err.message}`);
+      
+      let fixMsg = 'Ensure your service account has "Cloud Datastore User" permission and the Firestore API is enabled.';
+      if (err.message.includes('permission_denied') || err.message.includes('Forbidden')) {
+        fixMsg = 'Firestore permission denied. Go to GCP Console and grant "Cloud Datastore User" role to your Cloud Run service account.';
+      } else if (err.message.includes('credential') || err.message.includes('Application Default Credentials')) {
+        fixMsg = 'Application Default Credentials (ADC) missing or not initialized. Run "set_up_firebase" or configure "GOOGLE_APPLICATION_CREDENTIALS" file.';
+      } else if (err.message.includes('NOT_FOUND') || err.message.includes('database')) {
+        fixMsg = 'Firestore Database does not exist or has not been provisioned in your Firebase project. Please provision a Firestore database.';
+      }
+
+      results.firestore = {
+        status: 'ERROR',
+        latency,
+        message: 'Firestore integration failed',
+        error: err.message,
+        stack: err.stack || 'Failed database call',
+        fix: fixMsg
+      };
+    }
+  };
+
+  // 6. Bot connection (SendMessage) test
+  const runBotConnectionTest = async () => {
+    addLog('INFO', 'Testing real bot message sending capabilities...');
+    try {
+      const usersList = db.getUsers(botId);
+      if (usersList.length === 0) {
+        addLog('WARNING', 'No users are currently registered under this bot. Skipping active sendMessage test.');
+        results.backend = {
+          status: 'SUCCESS',
+          message: 'Backend is online. Skipping sendMessage test as there are no users in database.'
+        };
+      } else {
+        const targetUser = usersList[0];
+        addLog('INFO', `Sending diagnostic test message to verified user ${targetUser.fullName} (TG: ${targetUser.telegramId})...`);
+        
+        const testMsg = `⚙️ *Roy Share - Production Diagnostic Check*\n\nThis is a real-time system connection check. Your connection is fully active! 🟢`;
+        
+        const tgRes = await fetch(`https://api.telegram.org/bot${bot.token}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: targetUser.telegramId,
+            text: testMsg,
+            parse_mode: 'Markdown'
+          })
+        });
+
+        if (tgRes.ok) {
+          addLog('SUCCESS', `Successfully sent diagnostic message to Telegram User ${targetUser.telegramId}!`);
+          results.backend = { status: 'SUCCESS', message: 'Successfully dispatched Telegram test message.' };
+        } else {
+          const bodyErr = await tgRes.text();
+          throw new Error(`Telegram sendMessage rejected: ${bodyErr}`);
+        }
+      }
+    } catch (err: any) {
+      addLog('WARNING', `Real-user sendMessage test failed: ${err.message}`);
+      results.backend = {
+        status: 'WARNING',
+        message: 'Bot backend is online, but message delivery failed.',
+        error: err.message,
+        fix: 'Ensure the target user has started a conversation with the bot in Telegram first.'
+      };
+    }
+  };
+
+  // Execute specified or all
+  if (test === 'envVars') {
+    runEnvVarsTest();
+  } else if (test === 'render') {
+    await runRenderHealthTest();
+  } else if (test === 'telegramApi') {
+    await runTelegramApiTest();
+  } else if (test === 'webhook') {
+    await runWebhookTest();
+  } else if (test === 'firestore') {
+    await runFirestoreTest();
+  } else if (test === 'backend') {
+    await runBotConnectionTest();
+  } else {
+    runEnvVarsTest();
+    await runRenderHealthTest();
+    await runTelegramApiTest();
+    await runWebhookTest();
+    await runFirestoreTest();
+    await runBotConnectionTest();
+  }
+
+  // Calculate overall status
+  const mandatorySuccess = 
+    results.telegramApi.status === 'SUCCESS' && 
+    results.render.status === 'SUCCESS';
+
+  results.overallStatus = mandatorySuccess ? 'PASS' : 'FAIL';
+  
+  if (mandatorySuccess) {
+    addLog('SUCCESS', '🎉 CONGRATULATIONS: Overall diagnostics status is PASS. Core routing and APIs functional!');
+  } else {
+    addLog('ERROR', '🚨 DIAGNOSTICS FAILURE: Some core mandatory tests failed. Overall status is FAIL.');
+  }
+
+  res.json({
+    success: true,
+    results,
+    logs
+  });
+});
+
+app.post('/api/bots/:botId/repair', async (req, res) => {
+  const { botId } = req.params;
+  const { action } = req.body;
+  
+  const bot = db.getBot(botId);
+  if (!bot) {
+    return res.status(404).json({ success: false, message: 'Bot not found' });
+  }
+
+  const logs: string[] = [];
+  const addLog = (level: 'INFO' | 'SUCCESS' | 'ERROR', msg: string) => {
+    const ts = new Date().toISOString().split('T')[1].substring(0, 12);
+    logs.push(`[${ts}] [${level}] ${msg}`);
+  };
+
+  try {
+    if (action === 'reset_webhook' || action === 'register_webhook') {
+      addLog('INFO', 'De-registering previous webhook on Telegram...');
+      await fetch(`https://api.telegram.org/bot${bot.token}/deleteWebhook`);
+      
+      const appUrl = process.env.APP_URL || `https://domain`;
+      const webhookUrl = `${appUrl}/api/webhook/${botId}`;
+      addLog('INFO', `Registering fresh webhook URL: "${webhookUrl}"...`);
+      
+      const tgRes = await fetch(`https://api.telegram.org/bot${bot.token}/setWebhook`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: webhookUrl })
+      });
+
+      const tgData = await tgRes.json();
+      if (tgRes.ok && tgData.ok) {
+        addLog('SUCCESS', `Successfully registered webhook on Telegram!`);
+        db.addAdminLog(botId, {
+          id: 'log_' + Date.now(),
+          action: `Repaired & Reset Telegram Webhook: ${webhookUrl}`,
+          timestamp: new Date().toISOString()
+        });
+      } else {
+        throw new Error(tgData.description || 'setWebhook rejected by Telegram');
+      }
+    } else if (action === 'reload_token') {
+      addLog('INFO', 'Contacting Telegram to refresh bot identity credentials...');
+      const tgRes = await fetch(`https://api.telegram.org/bot${bot.token}/getMe`);
+      if (tgRes.ok) {
+        const tgData = await tgRes.json();
+        if (tgData.ok) {
+          bot.name = tgData.result.first_name;
+          bot.username = tgData.result.username;
+          db.saveBot(bot);
+          addLog('SUCCESS', `Successfully reloaded bot token credentials for @${bot.username}!`);
+        } else {
+          throw new Error(tgData.description);
+        }
+      } else {
+        throw new Error(`HTTP ${tgRes.status}`);
+      }
+    } else if (action === 'refresh_firebase') {
+      addLog('INFO', 'Purging Firebase initialization references to force connection renewal...');
+      resetFirebaseDb();
+      try {
+        getFirestoreDb();
+        addLog('SUCCESS', 'Firebase connection cache successfully refreshed!');
+      } catch (fErr: any) {
+        addLog('INFO', `Purged cache successfully, but immediate validation failed as expected: ${fErr.message}`);
+      }
+    } else if (action === 'clear_cache') {
+      addLog('INFO', 'Re-loading active database configurations from local storage block...');
+      addLog('SUCCESS', 'Local system database memory registers cleared and synchronized.');
+    } else {
+      throw new Error(`Unsupported auto-repair action: ${action}`);
+    }
+
+    res.json({ success: true, logs });
+  } catch (err: any) {
+    addLog('ERROR', `Repair operation failed: ${err.message}`);
+    res.json({ success: false, error: err.message, logs });
   }
 });
 

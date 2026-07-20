@@ -28,7 +28,7 @@ export default function AdminPanel({
 }: AdminPanelProps) {
   // Navigation
   const [activeTab, setActiveTab] = useState<'dashboard' | 'bots' | 'more'>('dashboard');
-  const [activeSubTab, setActiveSubTab] = useState<'channels' | 'users' | 'milestones' | 'wallet' | 'withdrawals' | 'broadcast' | 'analytics' | 'settings' | 'security' | 'backup' | null>(null);
+  const [activeSubTab, setActiveSubTab] = useState<'channels' | 'users' | 'milestones' | 'wallet' | 'withdrawals' | 'broadcast' | 'analytics' | 'settings' | 'security' | 'backup' | 'diagnostics' | null>(null);
 
   // Stats / Analytics state
   const [stats, setStats] = useState({
@@ -118,6 +118,91 @@ export default function AdminPanel({
   const [backupText, setBackupText] = useState('');
   const [isBackingUp, setIsBackingUp] = useState(false);
   const [isRestoring, setIsRestoring] = useState(false);
+
+  // Diagnostics & Auto Repair states
+  const [diagResults, setDiagResults] = useState<any>(null);
+  const [diagLogs, setDiagLogs] = useState<string[]>([]);
+  const [isDiagRunning, setIsDiagRunning] = useState(false);
+  const [overallPass, setOverallPass] = useState(false);
+  const [isRepairing, setIsRepairing] = useState<string | null>(null);
+
+  const runDiagnostics = async (botId: string, testName: string = 'all') => {
+    if (!botId) return;
+    setIsDiagRunning(true);
+    try {
+      const res = await fetch(`/api/bots/${botId}/diagnostics`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ test: testName })
+      });
+      const data = await res.json();
+      if (data.success) {
+        if (testName === 'all') {
+          setDiagResults(data.results);
+          setDiagLogs(data.logs);
+          setOverallPass(data.results.overallStatus === 'PASS');
+        } else {
+          setDiagResults((prev: any) => {
+            const nextResults = {
+              ...prev,
+              ...data.results
+            };
+            const mandatorySuccess = 
+              nextResults.telegramApi?.status === 'SUCCESS' && 
+              nextResults.render?.status === 'SUCCESS';
+            nextResults.overallStatus = mandatorySuccess ? 'PASS' : 'FAIL';
+            setOverallPass(mandatorySuccess);
+            return nextResults;
+          });
+          setDiagLogs(prev => [...prev, ...data.logs]);
+        }
+        showToast(testName === 'all' ? 'Diagnostics scan completed!' : `Diagnostic test ${testName} completed!`, 'success');
+      } else {
+        showToast(data.message || 'Diagnostics failed.', 'error');
+      }
+    } catch (err: any) {
+      console.error(err);
+      showToast('Could not reach backend diagnostics service.', 'error');
+    } finally {
+      setIsDiagRunning(false);
+    }
+  };
+
+  const runAutoRepair = async (botId: string, actionName: string) => {
+    if (!botId) return;
+    setIsRepairing(actionName);
+    try {
+      const res = await fetch(`/api/bots/${botId}/repair`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: actionName })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setDiagLogs(prev => [...prev, ...data.logs]);
+        showToast(`Auto repair action: "${actionName}" succeeded!`, 'success');
+        await runDiagnostics(botId, 'all');
+      } else {
+        if (data.logs) setDiagLogs(prev => [...prev, ...data.logs]);
+        showToast(data.error || 'Auto repair failed.', 'error');
+      }
+    } catch (err: any) {
+      console.error(err);
+      showToast('Repair service unreachable.', 'error');
+    } finally {
+      setIsRepairing(null);
+    }
+  };
+
+  useEffect(() => {
+    if (activeBot) {
+      runDiagnostics(activeBot.id, 'all');
+    } else {
+      setDiagResults(null);
+      setDiagLogs([]);
+      setOverallPass(false);
+    }
+  }, [activeBot]);
 
   // Toast notifications state
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
@@ -821,7 +906,10 @@ export default function AdminPanel({
                 referrerPolicy="no-referrer"
               />
               <span className="font-semibold text-indigo-400">@{activeBot.username}</span>
-              <span className={`w-1.5 h-1.5 rounded-full ${activeBot.status === 'active' ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'}`} />
+              <span className={`w-1.5 h-1.5 rounded-full ${overallPass ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'}`} />
+              <span className={`px-1.5 py-0.2 rounded font-mono text-[9px] font-bold ${overallPass ? 'bg-emerald-500/10 text-emerald-400' : 'bg-rose-500/10 text-rose-400 animate-pulse'}`}>
+                {overallPass ? 'CONNECTED' : 'DISCONNECTED'}
+              </span>
             </div>
           ) : (
             <span className="text-rose-400 font-semibold italic">No Active Bot selected</span>
@@ -1235,6 +1323,7 @@ export default function AdminPanel({
                     { id: 'settings', label: 'Bot Settings', desc: 'Toggles for maintenance, registration', icon: Settings, color: 'text-slate-400 bg-slate-500/10' },
                     { id: 'security', label: 'Security & Antifraud', desc: 'Track duplicate fingerprint accounts', icon: Shield, color: 'text-rose-400 bg-rose-500/10' },
                     { id: 'backup', label: 'Backup & Recovery', desc: 'Export or import system database JSON', icon: Database, color: 'text-teal-400 bg-teal-500/10' },
+                    { id: 'diagnostics', label: 'Diagnostics Center', desc: 'Real production bot and server diagnostics', icon: Activity, color: 'text-rose-400 bg-rose-500/10' },
                   ].map(item => (
                     <button
                       key={item.id}
@@ -1281,7 +1370,8 @@ export default function AdminPanel({
                      activeSubTab === 'broadcast' ? 'Broadcast' :
                      activeSubTab === 'analytics' ? 'Analytics' :
                      activeSubTab === 'settings' ? 'Bot Settings' :
-                     activeSubTab === 'security' ? 'Security & Antifraud' : 'Backup & Recovery'}
+                     activeSubTab === 'security' ? 'Security & Antifraud' :
+                     activeSubTab === 'diagnostics' ? 'Diagnostics Center' : 'Backup & Recovery'}
                   </span>
                 </div>
 
@@ -2145,6 +2235,267 @@ export default function AdminPanel({
                       >
                         {isRestoring ? 'Restoring state...' : 'Confirm Restore DB State'}
                       </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Sub-tab 11: Diagnostics Center */}
+                {activeSubTab === 'diagnostics' && (
+                  <div className="space-y-4">
+                    {/* Diagnostic Summary Header */}
+                    <div className="p-4 bg-slate-950/45 border border-slate-850 rounded-xl flex flex-col md:flex-row md:items-center justify-between gap-3 font-sans">
+                      <div>
+                        <h3 className="text-sm font-bold text-slate-100 flex items-center gap-1.5">
+                          <Activity className="w-4 h-4 text-rose-500 animate-pulse" /> Live System Diagnostics
+                        </h3>
+                        <p className="text-[10px] text-slate-400 mt-1 leading-normal">
+                          Run real-time API integrations, check webhooks, and evaluate backend infrastructure.
+                        </p>
+                      </div>
+
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => runDiagnostics(activeBot.id, 'all')}
+                          disabled={isDiagRunning}
+                          className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold rounded-lg transition disabled:opacity-40 text-xs shadow-md shadow-indigo-600/10 flex items-center gap-1.5"
+                        >
+                          {isDiagRunning ? (
+                            <>
+                              <RefreshCw className="w-3.5 h-3.5 animate-spin" /> Scanning...
+                            </>
+                          ) : (
+                            <>
+                              <Activity className="w-3.5 h-3.5" /> Run Full Diagnostics
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Report Card Grid */}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      {/* Left: Component Statuses */}
+                      <div className="p-4 bg-slate-950/40 border border-slate-850 rounded-xl space-y-3 font-sans">
+                        <h4 className="text-xs font-bold uppercase text-slate-400 tracking-wider">Infrastructure Checklist</h4>
+                        <div className="space-y-2 text-[11px]">
+                          {/* 1. Bot Token & API */}
+                          <div className="flex justify-between items-center p-2 bg-slate-950/30 border border-slate-850 rounded">
+                            <span className="text-slate-300 font-medium">Telegram API Status (getMe)</span>
+                            <span className={`px-2 py-0.5 rounded font-mono font-bold text-[9px] ${
+                              diagResults?.telegramApi?.status === 'SUCCESS' ? 'bg-emerald-500/15 text-emerald-400' :
+                              diagResults?.telegramApi?.status === 'ERROR' ? 'bg-rose-500/15 text-rose-400' : 'bg-slate-800 text-slate-500'
+                            }`}>
+                              {diagResults?.telegramApi?.status || 'NOT SCANNED'}
+                            </span>
+                          </div>
+
+                          {/* 2. Webhook Setup */}
+                          <div className="flex justify-between items-center p-2 bg-slate-950/30 border border-slate-850 rounded">
+                            <span className="text-slate-300 font-medium">Webhook Registration</span>
+                            <span className={`px-2 py-0.5 rounded font-mono font-bold text-[9px] ${
+                              diagResults?.webhook?.status === 'SUCCESS' ? 'bg-emerald-500/15 text-emerald-400' :
+                              diagResults?.webhook?.status === 'WARNING' ? 'bg-amber-500/15 text-amber-400' :
+                              diagResults?.webhook?.status === 'ERROR' ? 'bg-rose-500/15 text-rose-400' : 'bg-slate-800 text-slate-500'
+                            }`}>
+                              {diagResults?.webhook?.status || 'NOT SCANNED'}
+                            </span>
+                          </div>
+
+                          {/* 3. Firebase/Firestore */}
+                          <div className="flex justify-between items-center p-2 bg-slate-950/30 border border-slate-850 rounded">
+                            <span className="text-slate-300 font-medium">Firebase Firestore DB Connection</span>
+                            <span className={`px-2 py-0.5 rounded font-mono font-bold text-[9px] ${
+                              diagResults?.firestore?.status === 'SUCCESS' ? 'bg-emerald-500/15 text-emerald-400' :
+                              diagResults?.firestore?.status === 'WARNING' ? 'bg-amber-500/15 text-amber-400' :
+                              diagResults?.firestore?.status === 'ERROR' ? 'bg-rose-500/15 text-rose-400' : 'bg-slate-800 text-slate-500'
+                            }`}>
+                              {diagResults?.firestore?.status || 'NOT SCANNED'}
+                            </span>
+                          </div>
+
+                          {/* 4. Render Health */}
+                          <div className="flex justify-between items-center p-2 bg-slate-950/30 border border-slate-850 rounded">
+                            <span className="text-slate-300 font-medium">Render Engine Health Check</span>
+                            <span className={`px-2 py-0.5 rounded font-mono font-bold text-[9px] ${
+                              diagResults?.render?.status === 'SUCCESS' ? 'bg-emerald-500/15 text-emerald-400' :
+                              diagResults?.render?.status === 'ERROR' ? 'bg-rose-500/15 text-rose-400' : 'bg-slate-800 text-slate-500'
+                            }`}>
+                              {diagResults?.render?.status || 'NOT SCANNED'}
+                            </span>
+                          </div>
+
+                          {/* 5. Environment Config */}
+                          <div className="flex justify-between items-center p-2 bg-slate-950/30 border border-slate-850 rounded">
+                            <span className="text-slate-300 font-medium">Environment Variables</span>
+                            <span className={`px-2 py-0.5 rounded font-mono font-bold text-[9px] ${
+                              diagResults?.env?.status === 'SUCCESS' ? 'bg-emerald-500/15 text-emerald-400' :
+                              diagResults?.env?.status === 'WARNING' ? 'bg-amber-500/15 text-amber-400' :
+                              diagResults?.env?.status === 'ERROR' ? 'bg-rose-500/15 text-rose-400' : 'bg-slate-800 text-slate-500'
+                            }`}>
+                              {diagResults?.env?.status || 'NOT SCANNED'}
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Overall Bot Health Badge */}
+                        <div className="pt-2 flex justify-between items-center border-t border-slate-850 text-xs">
+                          <span className="font-bold text-slate-400">OVERALL SYSTEM HEALTH</span>
+                          <span className={`px-2.5 py-0.5 rounded font-mono font-extrabold text-[10px] tracking-wide ${
+                            overallPass ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'
+                          }`}>
+                            {overallPass ? 'PASS (HEALTHY)' : 'FAIL (UNHEALTHY)'}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Right: Manual Verification & Quick Tests */}
+                      <div className="p-4 bg-slate-950/40 border border-slate-850 rounded-xl space-y-3 font-sans">
+                        <h4 className="text-xs font-bold uppercase text-slate-400 tracking-wider">Isolated Diagnostics Tests</h4>
+                        <p className="text-[10px] text-slate-500 leading-normal">
+                          Run targeted unit tests against individual services to debug local component failures.
+                        </p>
+                        
+                        <div className="grid grid-cols-2 gap-2">
+                          <button
+                            onClick={() => runDiagnostics(activeBot.id, 'getMe')}
+                            disabled={isDiagRunning}
+                            className="p-2 bg-slate-950 border border-slate-800 hover:border-indigo-500 text-slate-200 text-left rounded-lg text-[10px] transition font-semibold"
+                          >
+                            ⚡ Test getMe (Telegram Token)
+                          </button>
+                          <button
+                            onClick={() => runDiagnostics(activeBot.id, 'webhook')}
+                            disabled={isDiagRunning}
+                            className="p-2 bg-slate-950 border border-slate-800 hover:border-indigo-500 text-slate-200 text-left rounded-lg text-[10px] transition font-semibold"
+                          >
+                            ⚡ Test Webhook URL
+                          </button>
+                          <button
+                            onClick={() => runDiagnostics(activeBot.id, 'firestore')}
+                            disabled={isDiagRunning}
+                            className="p-2 bg-slate-950 border border-slate-800 hover:border-indigo-500 text-slate-200 text-left rounded-lg text-[10px] transition font-semibold"
+                          >
+                            ⚡ Test Firestore Connection
+                          </button>
+                          <button
+                            onClick={() => runDiagnostics(activeBot.id, 'env')}
+                            disabled={isDiagRunning}
+                            className="p-2 bg-slate-950 border border-slate-800 hover:border-indigo-500 text-slate-200 text-left rounded-lg text-[10px] transition font-semibold"
+                          >
+                            ⚡ Test Environment & Port
+                          </button>
+                          <button
+                            onClick={() => runDiagnostics(activeBot.id, 'render')}
+                            disabled={isDiagRunning}
+                            className="p-2 bg-slate-950 border border-slate-800 hover:border-indigo-500 text-slate-200 text-left rounded-lg text-[10px] transition font-semibold"
+                          >
+                            ⚡ Test Render Health Path
+                          </button>
+                          <button
+                            onClick={() => runDiagnostics(activeBot.id, 'message')}
+                            disabled={isDiagRunning}
+                            className="p-2 bg-slate-950 border border-slate-800 hover:border-indigo-500 text-slate-200 text-left rounded-lg text-[10px] transition font-semibold"
+                          >
+                            ✉️ Test Backend Message
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Auto-Repair / Hook Management Panel */}
+                    <div className="p-4 bg-slate-950/40 border border-slate-850 rounded-xl space-y-3 font-sans">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <h4 className="text-xs font-bold uppercase text-slate-400 tracking-wider">Automated Repair Operations</h4>
+                          <p className="text-[10px] text-slate-500 mt-0.5 leading-normal">
+                            Direct low-level system commands to hot-reset, repair, and clear webhooks and caching profiles.
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+                        <button
+                          onClick={() => runAutoRepair(activeBot.id, 'resetWebhook')}
+                          disabled={isRepairing !== null}
+                          className="px-2.5 py-1.5 bg-slate-950 border border-rose-900 hover:border-rose-600 text-rose-400 hover:bg-rose-950/10 text-[10px] rounded-lg transition font-semibold flex items-center justify-center gap-1.5"
+                        >
+                          {isRepairing === 'resetWebhook' ? 'Executing...' : '♻️ Reset Webhook'}
+                        </button>
+                        <button
+                          onClick={() => runAutoRepair(activeBot.id, 'registerWebhook')}
+                          disabled={isRepairing !== null}
+                          className="px-2.5 py-1.5 bg-slate-950 border border-emerald-900 hover:border-emerald-600 text-emerald-400 hover:bg-emerald-950/10 text-[10px] rounded-lg transition font-semibold flex items-center justify-center gap-1.5"
+                        >
+                          {isRepairing === 'registerWebhook' ? 'Executing...' : '⚡ Register Webhook'}
+                        </button>
+                        <button
+                          onClick={() => runAutoRepair(activeBot.id, 'reloadToken')}
+                          disabled={isRepairing !== null}
+                          className="px-2.5 py-1.5 bg-slate-950 border border-indigo-900 hover:border-indigo-600 text-indigo-400 hover:bg-indigo-950/10 text-[10px] rounded-lg transition font-semibold flex items-center justify-center gap-1.5"
+                        >
+                          {isRepairing === 'reloadToken' ? 'Executing...' : '🔑 Reload Bot Token'}
+                        </button>
+                        <button
+                          onClick={() => runAutoRepair(activeBot.id, 'refreshFirebase')}
+                          disabled={isRepairing !== null}
+                          className="px-2.5 py-1.5 bg-slate-950 border border-yellow-900 hover:border-yellow-600 text-yellow-400 hover:bg-yellow-950/10 text-[10px] rounded-lg transition font-semibold flex items-center justify-center gap-1.5"
+                        >
+                          {isRepairing === 'refreshFirebase' ? 'Executing...' : '🔥 Refresh Firebase Connection'}
+                        </button>
+                        <button
+                          onClick={() => runAutoRepair(activeBot.id, 'restartSession')}
+                          disabled={isRepairing !== null}
+                          className="px-2.5 py-1.5 bg-slate-950 border border-sky-900 hover:border-sky-600 text-sky-400 hover:bg-sky-950/10 text-[10px] rounded-lg transition font-semibold flex items-center justify-center gap-1.5"
+                        >
+                          {isRepairing === 'restartSession' ? 'Executing...' : '🔄 Restart Telegram Session'}
+                        </button>
+                        <button
+                          onClick={() => runAutoRepair(activeBot.id, 'clearCache')}
+                          disabled={isRepairing !== null}
+                          className="px-2.5 py-1.5 bg-slate-950 border border-slate-800 hover:border-slate-500 text-slate-300 hover:bg-slate-950/50 text-[10px] rounded-lg transition font-semibold flex items-center justify-center gap-1.5"
+                        >
+                          {isRepairing === 'clearCache' ? 'Executing...' : '🗑️ Clear Config Cache'}
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Live Developer Console */}
+                    <div className="p-4 bg-slate-950 border border-slate-850 rounded-xl space-y-2">
+                      <div className="flex justify-between items-center pb-2 border-b border-slate-900">
+                        <div className="flex items-center gap-2">
+                          <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
+                          <h4 className="text-xs font-bold text-slate-400 tracking-wider font-mono uppercase">Live Diagnostics Console</h4>
+                        </div>
+                        <button
+                          onClick={() => {
+                            navigator.clipboard.writeText(diagLogs.join('\n'));
+                            showToast('Logs copied to clipboard', 'info');
+                          }}
+                          className="px-2 py-0.5 bg-slate-900 hover:bg-slate-850 text-slate-300 hover:text-white rounded border border-slate-800 text-[10px] font-mono transition"
+                        >
+                          Copy Logs
+                        </button>
+                      </div>
+
+                      <div className="bg-slate-950 border border-slate-900 p-3 rounded font-mono text-[10px] leading-relaxed max-h-60 overflow-y-auto space-y-1 select-text scrollbar-thin scrollbar-thumb-slate-800 scrollbar-track-transparent">
+                        {diagLogs.length === 0 ? (
+                          <div className="text-slate-600 italic">No logs generated. Initiate diagnostics or repair to stream output...</div>
+                        ) : (
+                          diagLogs.map((log, index) => {
+                            let textClass = "text-slate-300";
+                            if (log.includes("[ERROR]")) textClass = "text-rose-400 font-bold";
+                            else if (log.includes("[SUCCESS]")) textClass = "text-emerald-400 font-bold";
+                            else if (log.includes("[WARNING]")) textClass = "text-amber-400 font-bold";
+                            else if (log.includes("[INFO]")) textClass = "text-cyan-400";
+
+                            return (
+                              <div key={index} className={`${textClass} whitespace-pre-wrap break-all hover:bg-slate-900/50 p-0.5 rounded`}>
+                                {log}
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
                     </div>
                   </div>
                 )}
