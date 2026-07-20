@@ -1,0 +1,6 @@
+{
+  "name": "Roy Share",
+  "description": "Telegram Multi-Bot Management Platform with Telegram Mini App, Referral Milestone Wallet System, OTP Verification, Channel Verification, Wallet, Withdraw, Admin Dashboard, and Analytics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
